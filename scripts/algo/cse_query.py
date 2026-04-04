@@ -54,6 +54,8 @@ def build_query_relevance_scores(
     query_instruction: str = "Represent this Vietnamese question for retrieving relevant OCR graph nodes.",
     rel_text_weight: float = 0.4,
     rel_image_weight: float = 0.6,
+    preloaded_text_embedder: Any | None = None,
+    preloaded_clip: tuple[Any, Any] | None = None,
 ) -> dict[str, float]:
     if (
         (text_embeddings.ndim != 2 or text_embeddings.shape[0] == 0 or text_embeddings.shape[1] == 0)
@@ -61,7 +63,7 @@ def build_query_relevance_scores(
     ):
         raise ValueError("Both text and crop embeddings are empty. Build embeddings before running multimodal CSE.")
 
-    text_embedder = init_text_model(text_model_name, device)
+    text_embedder = preloaded_text_embedder or init_text_model(text_model_name, device)
     query_text_embedding = text_embedder.encode(
         [query_for_embedding],
         batch_size=1,
@@ -72,7 +74,10 @@ def build_query_relevance_scores(
     )
     query_text_vector = query_text_embedding[0]
 
-    clip_processor, clip_model = init_clip_model(image_model_name, device)
+    if preloaded_clip is None:
+        clip_processor, clip_model = init_clip_model(image_model_name, device)
+    else:
+        clip_processor, clip_model = preloaded_clip
     query_image_embedding = np.asarray(
         encode_clip_texts(
             processor=clip_processor,
@@ -365,6 +370,8 @@ def run_text_first_cse(
     allowed_relations: tuple[str, ...] | None = None,
     rel_text_weight: float = 0.4,
     rel_image_weight: float = 0.6,
+    preloaded_text_embedder: Any | None = None,
+    preloaded_clip: tuple[Any, Any] | None = None,
 ) -> dict[str, Any]:
     rel_scores = build_query_relevance_scores(
         query_for_embedding=query_for_embedding,
@@ -376,6 +383,8 @@ def run_text_first_cse(
         device=device,
         rel_text_weight=rel_text_weight,
         rel_image_weight=rel_image_weight,
+        preloaded_text_embedder=preloaded_text_embedder,
+        preloaded_clip=preloaded_clip,
     )
     seeds = select_top_k_seed_nodes(
         graph=graph_enriched,
