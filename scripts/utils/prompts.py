@@ -8,27 +8,70 @@ from spatial_graph.io_utils import fix_mojibake
 
 def build_vlm_prompt(query: str, context_nodes: list[dict[str, Any]], crop_paths: list[tuple[str, Path]]) -> str:
     lines: list[str] = []
-    lines.append("Bạn là trợ lý Visual Question Answering cho Tiếng Việt.")
-    lines.append("Hãy trả lời ngắn gọn, đúng trọng tâm, chỉ dựa trên ảnh gốc va OCR subgraph đã truy hồi.")
-    lines.append("Được quyền ghép nối thông tin từ các node OCR và crop OCR liên quan, nhưng đừng thêm bất kỳ kiến thức nền nào khác.")
-    lines.append("Đừng trả lời dựa trên kiến thức bên ngoài, chỉ đưa ra đáp án bằng Tiếng Việt dựa trên thông tin được cung cấp.")
-    lines.append("Trả lời thông tin chủ yếu qua ảnh gốc và các subgraph OCR chỉ dùng để hỗ trợ thông tin OCR bổ sung ngữ nghĩa")
-    lines.append("Nếu câu hỏi liên quan đến nguồn thì ưu tiên dùng thông tin từ OCR subgraph sau đó đối chứng với hình ảnh và đưa ra câu trả lời cuối cùng.")
+
+    # 🔒 Strong system instruction
+    lines.append("You are a strict Visual Question Answering (VQA) assistant.")
+    lines.append("Your task is to answer the question using ONLY the provided image and OCR subgraph context.")
     lines.append("")
-    lines.append(f"Câu hỏi: {fix_mojibake(query)}")
+    lines.append("CRITICAL RULES:")
+    lines.append("- Do NOT use any external knowledge, prior knowledge, or assumptions.")
+    lines.append("- Do NOT guess or infer beyond the visible evidence.")
+    lines.append("- If the answer is not clearly supported, say: 'Không đủ thông tin'.")
+    lines.append("- Prefer evidence from the original image; use OCR only as supporting information.")
+    lines.append("- If OCR and image conflict, trust the image more.")
+    lines.append("- Combine multiple OCR nodes ONLY if they clearly refer to the same entity.")
+    lines.append("- Be precise, concise, and factual.")
+    lines.append("- Answer in Vietnamese only.")
+    lines.append("- EXCEPTION: If the answer is explicitly shown in the image/OCR as English text, copy it exactly without translation.")
+    lines.append("- Do NOT translate, paraphrase, or modify extracted text.")
     lines.append("")
-    lines.append("Thông tin đính kèm:")
+    lines.append("ANSWERING STRATEGY:")
+    lines.append("1. Locate relevant regions in the image.")
+    lines.append("2. Match them with OCR nodes if applicable.")
+    lines.append("3. Verify consistency between image and OCR.")
+    lines.append("4. Produce a short final answer (no explanation).")
+    lines.append("")
+    lines.append("EXAMPLES:")
+    lines.append("Example 1:")
+    lines.append("Question: Biển ghi gì?")
+    lines.append("OCR: 'Cá cắn câu'")
+    lines.append("Answer: Cá cắn câu")
+    lines.append("")
+
+    # Example 2: avoid over-generation
+    lines.append("Example 2:")
+    lines.append("Question: Nội dung chính là gì?")
+    lines.append("OCR: 'dù lâu vẫn đợi Cá cắn câu'")
+    lines.append("Answer: Cá cắn câu")
+    lines.append("")
+
+# Example 3: English text
+    lines.append("Example 3:")
+    lines.append("Question: Tên thương hiệu là gì?")
+    lines.append("OCR: 'Highlands Coffee'")
+    lines.append("Answer: Highlands Coffee")
+    lines.append("")
+
+# Example 4: insufficient info
+    lines.append("Example 4:")
+    lines.append("Question: Người trong ảnh tên gì?")
+    lines.append("OCR: 'Hello world'")
+    lines.append("Answer: Không đủ thông tin")
+    lines.append("")
+    lines.append("")
+    lines.append(f"Question: {fix_mojibake(query)}")
+    lines.append("")
+    lines.append("ATTACHED INFORMATION:")
     if crop_paths:
-        lines.append("- Các ảnh tiếp theo là crop của các node OCR liên quan, theo đúng thứ tự dưới đây.")
+        lines.append("- The following images are OCR crops corresponding to nodes:")
         for crop_index, (node_id, _) in enumerate(crop_paths, start=1):
             lines.append(f"  crop_ref={crop_index} <-> node_id={node_id}")
     else:
-        lines.append("- Không có crop OCR bổ sung, chỉ có ảnh gốc.")
+        lines.append("- No OCR crops provided. Only the original image is available.")
     lines.append("")
-    lines.append("OCR subgraph context:")
-
+    lines.append("OCR SUBGRAPH CONTEXT:")
     if not context_nodes:
-        lines.append("- Không có node OCR nào được truy hồi.")
+        lines.append("- No OCR nodes retrieved.")
     else:
         for index, node in enumerate(context_nodes, start=1):
             lines.append(
@@ -36,6 +79,10 @@ def build_vlm_prompt(query: str, context_nodes: list[dict[str, Any]], crop_paths
                 f"score={node['final_score']:.4f} | rel={node['rel']:.4f} | bbox={node['bbox']} | "
                 f"text={node['text']}"
             )
+
+    lines.append("")
+    lines.append("FINAL ANSWER (concise, no explanation):")
+
     return "\n".join(lines)
 
 

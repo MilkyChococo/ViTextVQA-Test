@@ -4,12 +4,16 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
+import os
 import sys
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+from tqdm import tqdm
 
 from algo.cse_query import run_text_first_cse
 from encode.embeddings import init_clip_model, init_text_model, resolve_device
@@ -23,6 +27,8 @@ from model_qwen import DEFAULT_QWEN_MODEL_NAME, generate_with_qwen, init_qwen_mo
 from process.text_preprocess import preprocess_query_text
 from utils.config import GraphConfig
 from utils.prompts import build_vlm_prompt
+
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 
 def parse_args() -> argparse.Namespace:
@@ -38,14 +44,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lambda-hub", type=float, default=0.05, help="Hub penalty.")
     parser.add_argument("--max-nodes", type=int, default=100, help="Maximum nodes in each subgraph.")
     parser.add_argument("--max-edges", type=int, default=200, help="Maximum edges in each subgraph.")
-    parser.add_argument("--max-subgraphs", type=int, default=3, help="Maximum retrieved subgraphs to include.")
-    parser.add_argument("--max-nodes-per-subgraph", type=int, default=5, help="Maximum nodes per subgraph.")
-    parser.add_argument("--max-crops", type=int, default=0, help="Maximum node crop images to attach. Use 0 to attach all selected node crops.")
+    parser.add_argument("--max-subgraphs", type=int, default=2, help="Maximum retrieved subgraphs to include.")
+    parser.add_argument("--max-nodes-per-subgraph", type=int, default=3, help="Maximum nodes per subgraph.")
+    parser.add_argument("--max-crops", type=int, default=4, help="Maximum node crop images to attach. Use 0 to attach all selected node crops.")
     parser.add_argument("--temperature", type=float, default=0.7, help="Sampling temperature.")
-    parser.add_argument("--max-new-tokens", type=int, default=1024, help="Maximum newly generated tokens.")
+    parser.add_argument("--max-new-tokens", type=int, default=256, help="Maximum newly generated tokens.")
     parser.add_argument("--output", default="outputs/predictions/vitextvqa_test_qwen.json", help="Output JSON path.")
     parser.add_argument("--start-index", type=int, default=0, help="Start offset inside annotations.")
     parser.add_argument("--limit", type=int, default=None, help="Optional number of annotations to run.")
+    parser.add_argument("--max-graph-cache-size", type=int, default=1, help="Maximum number of per-image graph bundles kept in RAM.")
+    parser.add_argument("--text-retrieval-device", default="cuda", help="Device for BGE-M3 query embedding.")
+    parser.add_argument("--clip-retrieval-device", default="cpu", help="Device for CLIP query embedding.")
     parser.add_argument("--resume", action="store_true", help="Resume from an existing output JSON if it exists.")
     return parser.parse_args()
 
@@ -89,6 +98,37 @@ def build_prediction_payload(
     }
 
 
+def save_prediction_payload(path: Path, base_payload: dict[str, Any], answer_by_ann_id: dict[int, str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = build_prediction_payload(base_payload, answer_by_ann_id)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def cleanup_runtime_crops(crop_paths: list[tuple[str, Path]], runtime_crops_dir: Path) -> None:
+    runtime_root = runtime_crops_dir.resolve()
+    for _, crop_path in crop_paths:
+        try:
+            resolved = crop_path.resolve()
+        except Exception:
+            continue
+        if resolved.parent == runtime_root and resolved.exists():
+            try:
+                resolved.unlink()
+            except OSError:
+                pass
+
+
+def clear_runtime_memory() -> None:
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
 def main() -> None:
     try:
         sys.stdout.reconfigure(encoding="utf-8")
@@ -116,29 +156,35 @@ def main() -> None:
             ann_id = int(ann["id"])
             answers = ann.get("answers", [])
             if isinstance(answers, list) and answers:
-                answer_by_ann_id[ann_id] = str(answers[0])
+                answer = str(answers[0]).strip()
+                if answer:
+                    answer_by_ann_id[ann_id] = answer
 
     annotations = annotations[args.start_index :]
     if args.limit is not None:
         annotations = annotations[: args.limit]
 
     runtime_device = resolve_device("cuda")
-    text_embedder = init_text_model("BAAI/bge-m3", runtime_device)
-    clip_processor, clip_model = init_clip_model("openai/clip-vit-base-patch32", runtime_device)
+    text_retrieval_device = resolve_device(args.text_retrieval_device)
+    clip_retrieval_device = resolve_device(args.clip_retrieval_device)
+    text_embedder = init_text_model("BAAI/bge-m3", text_retrieval_device)
+    clip_processor, clip_model = init_clip_model("openai/clip-vit-base-patch32", clip_retrieval_device)
     qwen_model, qwen_processor = init_qwen_model(args.model)
 
-    graph_cache: dict[str, tuple[GraphConfig, dict[str, Any], np.ndarray, np.ndarray]] = {}
+    graph_cache: OrderedDict[str, tuple[GraphConfig, dict[str, Any], np.ndarray, np.ndarray]] = OrderedDict()
 
     processed = 0
     skipped = 0
     failed = 0
-    for ann in annotations:
+    progress_bar = tqdm(annotations, desc="RunTestQwen", unit="question")
+    for ann in progress_bar:
         ann_id = int(ann["id"])
         image_id = str(ann["image_id"])
         question = str(ann["question"])
 
         if args.resume and ann_id in answer_by_ann_id:
             skipped += 1
+            progress_bar.set_postfix(processed=processed, skipped=skipped, failed=failed)
             continue
 
         if image_id not in graph_cache:
@@ -151,8 +197,20 @@ def main() -> None:
             )
             graph_enriched, text_embeddings, crop_embeddings = load_graph_bundle(config)
             graph_cache[image_id] = (config, graph_enriched, text_embeddings, crop_embeddings)
+            if args.max_graph_cache_size > 0:
+                while len(graph_cache) > args.max_graph_cache_size:
+                    graph_cache.popitem(last=False)
+        else:
+            graph_cache.move_to_end(image_id)
 
         config, graph_enriched, text_embeddings, crop_embeddings = graph_cache[image_id]
+        runtime_crops_dir = config.output_dir / "vlm_qwen_runtime_crops"
+        crop_paths: list[tuple[str, Path]] = []
+        query_for_embedding: str | None = None
+        cse_payload: dict[str, Any] | None = None
+        context_nodes: list[dict[str, Any]] = []
+        prompt: str | None = None
+        answer: str | None = None
 
         try:
             query_for_embedding = preprocess_query_text(config, question)
@@ -164,7 +222,9 @@ def main() -> None:
                 query_for_embedding=query_for_embedding,
                 text_model_name=config.text_embedding_model,
                 image_model_name=config.image_embedding_model,
-                device=runtime_device,
+                device=text_retrieval_device,
+                text_device=text_retrieval_device,
+                image_device=clip_retrieval_device,
                 top_k=args.top_k,
                 hops=args.hops,
                 top_m=args.top_m,
@@ -186,7 +246,7 @@ def main() -> None:
             crop_paths = collect_crop_paths(
                 context_nodes,
                 image_path=config.image_path,
-                runtime_crops_dir=config.output_dir / "vlm_qwen_runtime_crops",
+                runtime_crops_dir=runtime_crops_dir,
                 max_crops=args.max_crops,
             )
             prompt = build_vlm_prompt(question, context_nodes=context_nodes, crop_paths=crop_paths)
@@ -205,16 +265,20 @@ def main() -> None:
             answer_by_ann_id[ann_id] = ""
             failed += 1
             print(f"[FAIL] ann_id={ann_id} image_id={image_id} error={type(exc).__name__}: {exc}")
+        finally:
+            cleanup_runtime_crops(crop_paths, runtime_crops_dir)
+            crop_paths = []
+            query_for_embedding = None
+            cse_payload = None
+            context_nodes = []
+            prompt = None
+            answer = None
+            clear_runtime_memory()
 
-        if (processed + skipped + failed) % 20 == 0:
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            partial_payload = build_prediction_payload(payload, answer_by_ann_id)
-            output_path.write_text(json.dumps(partial_payload, ensure_ascii=False, indent=2), encoding="utf-8")
-            print(f"progress processed={processed} skipped={skipped} failed={failed} output={output_path}")
+        save_prediction_payload(output_path, payload, answer_by_ann_id)
+        progress_bar.set_postfix(processed=processed, skipped=skipped, failed=failed, cache=len(graph_cache))
 
-    final_payload = build_prediction_payload(payload, answer_by_ann_id)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(final_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    save_prediction_payload(output_path, payload, answer_by_ann_id)
 
     print(f"processed={processed}")
     print(f"skipped={skipped}")

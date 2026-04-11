@@ -18,7 +18,7 @@ Pipeline hiện tại gồm:
 Khuyến nghị:
 
 - Python `3.10`
-- CUDA `12.1`
+- CUDA `12.4`
 - GPU có ít nhất:
   - `16GB VRAM` nếu chạy `Qwen2.5-VL-7B`
   - `24GB VRAM` nếu muốn chạy thoải mái hơn hoặc thử Vintern HF
@@ -35,9 +35,14 @@ pip install -r requirements.txt
 Nếu bạn muốn cài riêng PyTorch CUDA trước:
 
 ```bash
-pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu121
+pip install torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124
 pip install -r requirements.txt
 ```
+
+Lưu ý:
+
+- `transformers` mới chặn một số đường load checkpoint khi `torch < 2.6` vì vấn đề bảo mật liên quan `torch.load`
+- nếu bạn chạy trên Vast/Linux, nên dùng `torch==2.6.0` hoặc mới hơn
 
 Kiểm tra GPU:
 

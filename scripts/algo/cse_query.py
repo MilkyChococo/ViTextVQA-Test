@@ -50,6 +50,8 @@ def build_query_relevance_scores(
     text_model_name: str,
     image_model_name: str,
     device: str = "cpu",
+    text_device: str | None = None,
+    image_device: str | None = None,
     batch_size: int = 8,
     query_instruction: str = "Represent this Vietnamese question for retrieving relevant OCR graph nodes.",
     rel_text_weight: float = 0.4,
@@ -57,13 +59,16 @@ def build_query_relevance_scores(
     preloaded_text_embedder: Any | None = None,
     preloaded_clip: tuple[Any, Any] | None = None,
 ) -> dict[str, float]:
+    text_runtime_device = text_device or device
+    image_runtime_device = image_device or device
+
     if (
         (text_embeddings.ndim != 2 or text_embeddings.shape[0] == 0 or text_embeddings.shape[1] == 0)
         and (crop_embeddings.ndim != 2 or crop_embeddings.shape[0] == 0 or crop_embeddings.shape[1] == 0)
     ):
         raise ValueError("Both text and crop embeddings are empty. Build embeddings before running multimodal CSE.")
 
-    text_embedder = preloaded_text_embedder or init_text_model(text_model_name, device)
+    text_embedder = preloaded_text_embedder or init_text_model(text_model_name, text_runtime_device)
     query_text_embedding = text_embedder.encode(
         [query_for_embedding],
         batch_size=1,
@@ -71,24 +76,33 @@ def build_query_relevance_scores(
         normalize_embeddings=True,
         show_progress_bar=False,
         prompt_name=None,
+        device=text_runtime_device,
     )
     query_text_vector = query_text_embedding[0]
 
-    if preloaded_clip is None:
-        clip_processor, clip_model = init_clip_model(image_model_name, device)
-    else:
-        clip_processor, clip_model = preloaded_clip
-    query_image_embedding = np.asarray(
-        encode_clip_texts(
-            processor=clip_processor,
-            model=clip_model,
-            texts=[query_for_embedding],
-            device=device,
-            batch_size=1,
-        ),
-        dtype=np.float32,
+    use_image_relevance = (
+        rel_image_weight > 0.0
+        and crop_embeddings.ndim == 2
+        and crop_embeddings.shape[0] > 0
+        and crop_embeddings.shape[1] > 0
     )
-    query_image_vector = query_image_embedding[0]
+    query_image_vector: np.ndarray | None = None
+    if use_image_relevance:
+        if preloaded_clip is None:
+            clip_processor, clip_model = init_clip_model(image_model_name, image_runtime_device)
+        else:
+            clip_processor, clip_model = preloaded_clip
+        query_image_embedding = np.asarray(
+            encode_clip_texts(
+                processor=clip_processor,
+                model=clip_model,
+                texts=[query_for_embedding],
+                device=image_runtime_device,
+                batch_size=1,
+            ),
+            dtype=np.float32,
+        )
+        query_image_vector = query_image_embedding[0]
 
     scores: dict[str, float] = {}
     for node in graph.get("nodes", []):
@@ -113,6 +127,7 @@ def build_query_relevance_scores(
         crop_row = int(node.get("crop_embedding_index", -1))
         if (
             rel_image_weight > 0.0
+            and query_image_vector is not None
             and crop_embeddings.ndim == 2
             and crop_embeddings.shape[1] > 0
             and 0 <= crop_row < crop_embeddings.shape[0]
@@ -358,6 +373,8 @@ def run_text_first_cse(
     text_model_name: str,
     image_model_name: str,
     device: str = "cpu",
+    text_device: str | None = None,
+    image_device: str | None = None,
     top_k: int = 5,
     hops: int = 2,
     top_m: int = 5,
@@ -381,6 +398,8 @@ def run_text_first_cse(
         text_model_name=text_model_name,
         image_model_name=image_model_name,
         device=device,
+        text_device=text_device,
+        image_device=image_device,
         rel_text_weight=rel_text_weight,
         rel_image_weight=rel_image_weight,
         preloaded_text_embedder=preloaded_text_embedder,
