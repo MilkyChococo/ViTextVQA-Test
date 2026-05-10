@@ -18,6 +18,7 @@ from utils.config import GraphConfig
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build offline graphs for the whole ViTextVQA test split.")
+    parser.add_argument("--image-id", default=None, help="Optional image id to process only one image.")
     parser.add_argument("--split-json", default=None, help="Path to ViTextVQA_test.json. Defaults to repo dataset file.")
     parser.add_argument("--image-root", default=None, help="Path to st_images directory.")
     parser.add_argument("--ocr-root", default=None, help="Path to OCR root directory, e.g. outputs/OCR_img.")
@@ -67,9 +68,15 @@ def main() -> None:
         raise FileNotFoundError(f"OCR root not found: {ocr_root}")
 
     images = load_test_images(split_json_path)
-    images = images[args.start_index :]
-    if args.limit is not None:
-        images = images[: args.limit]
+    if args.image_id is not None:
+        selected_image_id = str(args.image_id).strip()
+        images = [item for item in images if str(item.get("id")) == selected_image_id]
+        if not images:
+            raise ValueError(f"Image id not found in split: {selected_image_id}")
+    else:
+        images = images[args.start_index :]
+        if args.limit is not None:
+            images = images[: args.limit]
 
     output_root.mkdir(parents=True, exist_ok=True)
     batch_dir = output_root / "_batch"

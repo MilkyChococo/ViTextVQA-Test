@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Run GridSearchCV over the ViTextVQA dev split using the existing Qwen workflow."""
+"""Run a checkpointed grid search over a labeled ViTextVQA split using the existing Qwen workflow."""
 
 from __future__ import annotations
 
@@ -32,10 +32,10 @@ from utils.prompts import build_vlm_prompt
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 DEFAULT_PARAM_GRID: dict[str, list[Any]] = {
-    "hops": [1, 2, 3, 4, 5],
-    "threshold": [0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50],
-    "alpha": [0.3, 0.4, 0.5],
-    "lambda_hub": [0.01, 0.03, 0.05, 0.07, 0.10],
+    "hops": [2, 3, 4, 5],
+    "threshold": [0.25, 0.35, 0.45, 0.55],
+    "alpha": [0.3, 0.4, 0.5, 0.6],
+    "lambda_hub": [0.03, 0.05, 0.07, 0.10],
 }
 
 _TEXT_MODEL_CACHE: dict[tuple[str, str], Any] = {}
@@ -46,7 +46,7 @@ _GRAPH_BUNDLE_CACHE: OrderedDict[tuple[str, str], tuple[GraphConfig, dict[str, A
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Tune ViTextVQA hyperparameters on any labeled split with GroupKFold + GridSearchCV."
+        description="Tune ViTextVQA hyperparameters on any labeled split with GroupKFold and checkpointed grid search."
     )
     parser.add_argument(
         "--dev-json",
@@ -71,7 +71,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--param-grid-json",
         default=None,
-        help="Optional JSON string for GridSearchCV param_grid. Defaults to a small retrieval grid.",
+        help="Optional JSON string for the parameter grid. Defaults to a small retrieval grid.",
     )
     parser.add_argument("--cv", type=int, default=3, help="Number of GroupKFold splits.")
     parser.add_argument(
@@ -127,12 +127,28 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Maximum number of per-image graph bundles kept in RAM.",
     )
-    parser.add_argument("--n-jobs", type=int, default=1, help="GridSearchCV n_jobs. Keep 1 when using a GPU model.")
-    parser.add_argument("--verbose", type=int, default=2, help="GridSearchCV verbosity.")
+    parser.add_argument("--n-jobs", type=int, default=1, help="Reserved for compatibility. The search runs sequentially.")
+    parser.add_argument("--verbose", type=int, default=2, help="Search verbosity.")
+    parser.add_argument("--resume", action="store_true", help="Resume from an existing checkpoint if available.")
+    parser.add_argument(
+        "--checkpoint-json",
+        default=None,
+        help="Optional checkpoint JSON path. Defaults next to --output.",
+    )
+    parser.add_argument(
+        "--progress-jsonl",
+        default=None,
+        help="Optional JSONL log path for per-fold progress. Defaults next to --output.",
+    )
+    parser.add_argument(
+        "--question-log-jsonl",
+        default=None,
+        help="Optional base JSONL path for per-question predictions. Each candidate is saved as a separate JSONL file.",
+    )
     parser.add_argument(
         "--output",
         default="outputs/search/gridsearch_qwen_dev_results.json",
-        help="Output JSON path for GridSearchCV results.",
+        help="Output JSON path for final grid search results.",
     )
     return parser.parse_args()
 
@@ -249,6 +265,84 @@ def average_metric(
     return total / count if count else 0.0
 
 
+def build_candidate_key(params: dict[str, Any]) -> str:
+    return json.dumps(params, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def append_jsonl_record(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+def build_candidate_question_log_dir(base_path: Path) -> Path:
+    return base_path.with_suffix("")
+
+
+def build_candidate_question_log_path(base_path: Path, candidate_index: int) -> Path:
+    log_dir = build_candidate_question_log_dir(base_path)
+    return log_dir / f"candidate_{candidate_index:04d}.jsonl"
+
+
+def summarize_candidate_result(
+    candidate_index: int,
+    candidate_key: str,
+    params: dict[str, Any],
+    fold_results: list[dict[str, Any]],
+    total_folds: int,
+    question_log_path: Path | None = None,
+) -> dict[str, Any]:
+    ordered_folds = sorted(fold_results, key=lambda item: int(item["fold_index"]))
+    completed_folds = len(ordered_folds)
+    mean_f1 = float(np.mean([item["f1"] for item in ordered_folds])) if ordered_folds else 0.0
+    std_f1 = float(np.std([item["f1"] for item in ordered_folds])) if ordered_folds else 0.0
+    mean_em = float(np.mean([item["em"] for item in ordered_folds])) if ordered_folds else 0.0
+    std_em = float(np.std([item["em"] for item in ordered_folds])) if ordered_folds else 0.0
+    return {
+        "candidate_index": candidate_index,
+        "candidate_key": candidate_key,
+        "params": params,
+        "status": "completed" if completed_folds == total_folds else "partial",
+        "completed_folds": completed_folds,
+        "total_folds": total_folds,
+        "mean_test_f1": round(mean_f1, 6),
+        "std_test_f1": round(std_f1, 6),
+        "mean_test_em": round(mean_em, 6),
+        "std_test_em": round(std_em, 6),
+        "question_log_jsonl": str(question_log_path) if question_log_path is not None else None,
+        "fold_results": ordered_folds,
+    }
+
+
+def save_search_checkpoint(
+    path: Path,
+    *,
+    metadata: dict[str, Any],
+    candidate_results: list[dict[str, Any]],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    completed = [item for item in candidate_results if item.get("status") == "completed"]
+    best_completed = max(
+        completed,
+        key=lambda item: (
+            float(item.get("mean_test_f1", 0.0)),
+            float(item.get("mean_test_em", 0.0)),
+            -int(item.get("candidate_index", 10**9)),
+        ),
+        default=None,
+    )
+    payload = dict(metadata)
+    payload.update(
+        {
+            "completed_candidates": len(completed),
+            "total_recorded_candidates": len(candidate_results),
+            "candidate_results": candidate_results,
+            "best_completed_candidate": best_completed,
+        }
+    )
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 class ViTextVQAQwenEstimator:
     def __init__(
         self,
@@ -293,6 +387,8 @@ class ViTextVQAQwenEstimator:
         self.clip_retrieval_device = clip_retrieval_device
         self.max_graph_cache_size = max_graph_cache_size
         self._prediction_cache: dict[tuple[int, ...], np.ndarray] = {}
+        self._question_log_path: Path | None = None
+        self._question_log_context: dict[str, Any] | None = None
 
     def get_params(self, deep: bool = True) -> dict[str, Any]:
         return {
@@ -329,6 +425,10 @@ class ViTextVQAQwenEstimator:
         self._ensure_runtime()
         return self
 
+    def set_question_log(self, path: Path | None, context: dict[str, Any] | None) -> None:
+        self._question_log_path = path
+        self._question_log_context = dict(context) if context is not None else None
+
     def predict(self, X: np.ndarray) -> np.ndarray:
         cache_key = tuple(int(item["id"]) for item in X)
         if cache_key in self._prediction_cache:
@@ -344,7 +444,9 @@ class ViTextVQAQwenEstimator:
             disable=len(X) <= 1,
         )
         for ann in iterator:
-            predictions.append(self._predict_one(ann))
+            prediction = self._predict_one(ann)
+            predictions.append(prediction)
+            self._append_question_log(ann, prediction)
         output = np.asarray(predictions, dtype=object)
         self._prediction_cache[cache_key] = output
         return output.copy()
@@ -361,6 +463,34 @@ class ViTextVQAQwenEstimator:
             f"a={self.alpha:.2f} "
             f"l={self.lambda_hub:.2f} "
             f"n={num_questions}"
+        )
+
+    def _append_question_log(self, ann: dict[str, Any], prediction: str) -> None:
+        if self._question_log_path is None or self._question_log_context is None:
+            return
+
+        prediction_text = raw_text(prediction)
+        answers = [raw_text(item) for item in ann.get("answers", [])]
+        append_jsonl_record(
+            self._question_log_path,
+            {
+                **self._question_log_context,
+                "ann_id": int(ann["id"]),
+                "image_id": str(ann["image_id"]),
+                "image_filename": str(ann["image_filename"]),
+                "question": raw_text(ann["question"]),
+                "answers": answers,
+                "prediction": prediction_text,
+                "has_prediction": bool(prediction_text.strip()),
+                "exact_match": round(
+                    float(metric_max_over_ground_truths(exact_match_score, prediction_text, answers)),
+                    6,
+                ),
+                "f1": round(
+                    float(metric_max_over_ground_truths(f1_score, prediction_text, answers)),
+                    6,
+                ),
+            },
         )
 
     def _ensure_runtime(self) -> tuple[Any, tuple[Any, Any], tuple[Any, Any]]:
@@ -481,16 +611,6 @@ class ViTextVQAQwenEstimator:
             clear_runtime_memory()
 
 
-def f1_scorer(estimator: ViTextVQAQwenEstimator, X: np.ndarray, y: np.ndarray | None = None) -> float:
-    predictions = estimator.predict(X)
-    return average_metric(predictions, X, f1_score)
-
-
-def em_scorer(estimator: ViTextVQAQwenEstimator, X: np.ndarray, y: np.ndarray | None = None) -> float:
-    predictions = estimator.predict(X)
-    return average_metric(predictions, X, exact_match_score)
-
-
 def main() -> None:
     try:
         sys.stdout.reconfigure(encoding="utf-8")
@@ -498,7 +618,7 @@ def main() -> None:
         pass
 
     try:
-        from sklearn.model_selection import GridSearchCV, GroupKFold, ParameterGrid
+        from sklearn.model_selection import GroupKFold, ParameterGrid
     except ImportError as exc:
         raise ImportError(
             "Missing dependency 'scikit-learn'. Install it with: pip install scikit-learn"
@@ -512,6 +632,9 @@ def main() -> None:
     gt_json_path = resolve_repo_relative_path(repo_root, args.gt_json)
     graph_root = resolve_repo_relative_path(repo_root, args.graph_root)
     output_path = resolve_repo_relative_path(repo_root, args.output)
+    checkpoint_json_path = resolve_repo_relative_path(repo_root, args.checkpoint_json)
+    progress_jsonl_path = resolve_repo_relative_path(repo_root, args.progress_jsonl)
+    question_log_jsonl_path = resolve_repo_relative_path(repo_root, args.question_log_jsonl)
 
     if dev_json_path is None or graph_root is None or output_path is None:
         raise ValueError("Failed to resolve required paths.")
@@ -519,6 +642,13 @@ def main() -> None:
         raise FileNotFoundError(f"Dev JSON not found: {dev_json_path}")
     if gt_json_path is not None and not gt_json_path.exists():
         raise FileNotFoundError(f"Ground-truth JSON not found: {gt_json_path}")
+    if checkpoint_json_path is None:
+        checkpoint_json_path = output_path.with_name(f"{output_path.stem}_checkpoint.json")
+    if progress_jsonl_path is None:
+        progress_jsonl_path = output_path.with_name(f"{output_path.stem}_progress.jsonl")
+    if question_log_jsonl_path is None:
+        question_log_jsonl_path = output_path.with_name(f"{output_path.stem}_questions.jsonl")
+    question_log_dir = build_candidate_question_log_dir(question_log_jsonl_path)
 
     dev_payload = load_payload(dev_json_path)
     gt_payload = load_payload(gt_json_path) if gt_json_path is not None else None
@@ -552,37 +682,35 @@ def main() -> None:
     y = np.zeros(len(annotations), dtype=np.int32)
 
     param_grid = parse_param_grid(args.param_grid_json)
-    total_candidates = len(list(ParameterGrid(param_grid)))
-
-    estimator = ViTextVQAQwenEstimator(
-        repo_root=str(repo_root),
-        graph_root=str(graph_root),
-        model_name=args.model,
-        top_m=args.top_m,
-        lambda_hub=args.lambda_hub,
-        max_nodes=args.max_nodes,
-        max_edges=args.max_edges,
-        max_subgraphs=args.max_subgraphs,
-        max_nodes_per_subgraph=args.max_nodes_per_subgraph,
-        max_crops=args.max_crops,
-        temperature=args.temperature,
-        max_new_tokens=args.max_new_tokens,
-        text_retrieval_device=resolve_device(args.text_retrieval_device),
-        clip_retrieval_device=resolve_device(args.clip_retrieval_device),
-        max_graph_cache_size=args.max_graph_cache_size,
-    )
-
+    candidate_params_list = list(ParameterGrid(param_grid))
+    total_candidates = len(candidate_params_list)
     splitter = GroupKFold(n_splits=args.cv)
-    search = GridSearchCV(
-        estimator=estimator,
-        param_grid=param_grid,
-        scoring={"f1": f1_scorer, "em": em_scorer},
-        refit="f1",
-        cv=splitter,
-        n_jobs=args.n_jobs,
-        verbose=args.verbose,
-        return_train_score=False,
-    )
+    splits = list(splitter.split(X, y, groups))
+
+    base_estimator_params = {
+        "repo_root": str(repo_root),
+        "graph_root": str(graph_root),
+        "model_name": args.model,
+        "top_m": args.top_m,
+        "lambda_hub": args.lambda_hub,
+        "max_nodes": args.max_nodes,
+        "max_edges": args.max_edges,
+        "max_subgraphs": args.max_subgraphs,
+        "max_nodes_per_subgraph": args.max_nodes_per_subgraph,
+        "max_crops": args.max_crops,
+        "temperature": args.temperature,
+        "max_new_tokens": args.max_new_tokens,
+        "text_retrieval_device": resolve_device(args.text_retrieval_device),
+        "clip_retrieval_device": resolve_device(args.clip_retrieval_device),
+        "max_graph_cache_size": args.max_graph_cache_size,
+    }
+
+    if args.n_jobs != 1:
+        print("[INFO] --n-jobs is ignored by the checkpointed manual search; running sequentially.")
+
+    if not args.resume and progress_jsonl_path.exists():
+        progress_jsonl_path.write_text("", encoding="utf-8")
+    question_log_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"split_json={dev_json_path}")
     print(f"graph_root={graph_root}")
@@ -592,56 +720,213 @@ def main() -> None:
     print(f"grid_candidates={total_candidates}")
     print(f"total_fits={total_candidates * args.cv}")
 
-    search.fit(X, y, groups=groups)
-
-    best_index = int(search.best_index_)
-    best_mean_f1 = float(search.cv_results_["mean_test_f1"][best_index])
-    best_mean_em = float(search.cv_results_["mean_test_em"][best_index])
-
-    ranked_indices = sorted(
-        range(len(search.cv_results_["params"])),
-        key=lambda idx: float(search.cv_results_["mean_test_f1"][idx]),
-        reverse=True,
-    )
-    top_results: list[dict[str, Any]] = []
-    for idx in ranked_indices[: min(10, len(ranked_indices))]:
-        top_results.append(
-            {
-                "rank": len(top_results) + 1,
-                "params": search.cv_results_["params"][idx],
-                "mean_test_f1": round(float(search.cv_results_["mean_test_f1"][idx]), 6),
-                "std_test_f1": round(float(search.cv_results_["std_test_f1"][idx]), 6),
-                "mean_test_em": round(float(search.cv_results_["mean_test_em"][idx]), 6),
-                "std_test_em": round(float(search.cv_results_["std_test_em"][idx]), 6),
-            }
-        )
-
-    result_payload = {
+    metadata = {
         "split_json": str(dev_json_path),
         "gt_json": str(gt_json_path) if gt_json_path is not None else None,
         "graph_root": str(graph_root),
         "num_annotations": len(annotations),
         "num_unique_image_groups": len(unique_groups),
         "sample_ratio": args.sample_ratio,
+        "limit": args.limit,
         "cv": args.cv,
         "n_jobs": args.n_jobs,
+        "search_backend": "manual_parameter_grid",
         "refit_metric": "f1",
         "param_grid": param_grid,
         "grid_candidates": total_candidates,
         "total_fits": total_candidates * args.cv,
-        "best_index": best_index,
-        "best_params": search.best_params_,
-        "best_mean_test_f1": round(best_mean_f1, 6),
-        "best_mean_test_em": round(best_mean_em, 6),
-        "top_results": top_results,
+        "question_log_base": str(question_log_jsonl_path),
+        "question_log_dir": str(question_log_dir),
     }
+
+    recorded_results: list[dict[str, Any]] = []
+    if args.resume and checkpoint_json_path.exists():
+        checkpoint_payload = load_json(checkpoint_json_path)
+        recorded_results = list(checkpoint_payload.get("candidate_results", []))
+        print(f"resume_checkpoint={checkpoint_json_path}")
+        print(f"loaded_recorded_candidates={len(recorded_results)}")
+
+    recorded_by_key = {
+        str(item.get("candidate_key")): item
+        for item in recorded_results
+        if item.get("candidate_key")
+    }
+
+    candidate_iterator = tqdm(
+        list(enumerate(candidate_params_list, start=1)),
+        total=total_candidates,
+        desc="GridCandidates",
+        unit="candidate",
+        dynamic_ncols=True,
+    )
+    for candidate_index, params in candidate_iterator:
+        candidate_key = build_candidate_key(params)
+        existing = recorded_by_key.get(candidate_key)
+        if existing is not None and existing.get("status") == "completed":
+            candidate_iterator.set_postfix(status="resume-skip", idx=candidate_index)
+            continue
+
+        candidate_question_log_path = build_candidate_question_log_path(question_log_jsonl_path, candidate_index)
+        if not args.resume and candidate_question_log_path.exists():
+            candidate_question_log_path.unlink()
+
+        estimator = ViTextVQAQwenEstimator(**base_estimator_params)
+        estimator.set_params(**params)
+
+        fold_results = list(existing.get("fold_results", [])) if existing is not None else []
+        done_folds = {int(item["fold_index"]) for item in fold_results}
+
+        for fold_index, (train_idx, val_idx) in enumerate(splits, start=1):
+            if fold_index in done_folds:
+                continue
+
+            X_train = X[train_idx]
+            y_train = y[train_idx]
+            X_val = X[val_idx]
+
+            if args.verbose:
+                print(
+                    f"[CAND {candidate_index}/{total_candidates}] "
+                    f"fold={fold_index}/{args.cv} params={params}"
+                )
+
+            estimator.fit(X_train, y_train)
+            estimator.set_question_log(
+                candidate_question_log_path,
+                {
+                    "candidate_index": candidate_index,
+                    "candidate_key": candidate_key,
+                    "params": params,
+                    "fold_index": fold_index,
+                },
+            )
+            predictions = estimator.predict(X_val)
+            estimator.set_question_log(None, None)
+            fold_f1 = average_metric(predictions, X_val, f1_score)
+            fold_em = average_metric(predictions, X_val, exact_match_score)
+
+            fold_record = {
+                "fold_index": fold_index,
+                "num_train": int(len(train_idx)),
+                "num_val": int(len(val_idx)),
+                "f1": round(float(fold_f1), 6),
+                "em": round(float(fold_em), 6),
+            }
+            fold_results.append(fold_record)
+            fold_results.sort(key=lambda item: int(item["fold_index"]))
+
+            append_jsonl_record(
+                progress_jsonl_path,
+                {
+                    "candidate_index": candidate_index,
+                    "candidate_key": candidate_key,
+                    "params": params,
+                    "fold_result": fold_record,
+                },
+            )
+
+            candidate_summary = summarize_candidate_result(
+                candidate_index=candidate_index,
+                candidate_key=candidate_key,
+                params=params,
+                fold_results=fold_results,
+                total_folds=args.cv,
+                question_log_path=candidate_question_log_path,
+            )
+            recorded_by_key[candidate_key] = candidate_summary
+
+            current_results = sorted(
+                recorded_by_key.values(),
+                key=lambda item: int(item.get("candidate_index", 10**9)),
+            )
+            save_search_checkpoint(
+                checkpoint_json_path,
+                metadata=metadata,
+                candidate_results=current_results,
+            )
+            candidate_iterator.set_postfix(
+                idx=candidate_index,
+                fold=f"{fold_index}/{args.cv}",
+                f1=f"{fold_f1:.4f}",
+                em=f"{fold_em:.4f}",
+            )
+
+        candidate_summary = summarize_candidate_result(
+            candidate_index=candidate_index,
+            candidate_key=candidate_key,
+            params=params,
+            fold_results=fold_results,
+            total_folds=args.cv,
+            question_log_path=candidate_question_log_path,
+        )
+        recorded_by_key[candidate_key] = candidate_summary
+        current_results = sorted(
+            recorded_by_key.values(),
+            key=lambda item: int(item.get("candidate_index", 10**9)),
+        )
+        save_search_checkpoint(
+            checkpoint_json_path,
+            metadata=metadata,
+            candidate_results=current_results,
+        )
+
+    final_candidate_results = sorted(
+        recorded_by_key.values(),
+        key=lambda item: int(item.get("candidate_index", 10**9)),
+    )
+    completed_candidates = [item for item in final_candidate_results if item.get("status") == "completed"]
+    ranked_candidates = sorted(
+        completed_candidates,
+        key=lambda item: (
+            -float(item.get("mean_test_f1", 0.0)),
+            -float(item.get("mean_test_em", 0.0)),
+            int(item.get("candidate_index", 10**9)),
+        ),
+    )
+    top_results: list[dict[str, Any]] = []
+    for item in ranked_candidates[: min(10, len(ranked_candidates))]:
+        top_results.append(
+            {
+                "rank": len(top_results) + 1,
+                "params": item["params"],
+                "mean_test_f1": item["mean_test_f1"],
+                "std_test_f1": item["std_test_f1"],
+                "mean_test_em": item["mean_test_em"],
+                "std_test_em": item["std_test_em"],
+            }
+        )
+
+    best_candidate = ranked_candidates[0] if ranked_candidates else None
+    result_payload = dict(metadata)
+    result_payload.update(
+        {
+            "completed_candidates": len(completed_candidates),
+            "candidate_results": final_candidate_results,
+            "best_index": int(best_candidate["candidate_index"]) if best_candidate is not None else None,
+            "best_params": best_candidate["params"] if best_candidate is not None else None,
+            "best_mean_test_f1": best_candidate["mean_test_f1"] if best_candidate is not None else None,
+            "best_mean_test_em": best_candidate["mean_test_em"] if best_candidate is not None else None,
+            "top_results": top_results,
+            "checkpoint_json": str(checkpoint_json_path),
+            "progress_jsonl": str(progress_jsonl_path),
+            "question_log_base": str(question_log_jsonl_path),
+            "question_log_dir": str(question_log_dir),
+        }
+    )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(result_payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    print(f"best_params={search.best_params_}")
-    print(f"best_mean_test_f1={best_mean_f1:.6f}")
-    print(f"best_mean_test_em={best_mean_em:.6f}")
+    print(f"checkpoint_json={checkpoint_json_path}")
+    print(f"progress_jsonl={progress_jsonl_path}")
+    print(f"question_log_base={question_log_jsonl_path}")
+    print(f"question_log_dir={question_log_dir}")
+    if best_candidate is not None:
+        print(f"best_params={best_candidate['params']}")
+        print(f"best_mean_test_f1={float(best_candidate['mean_test_f1']):.6f}")
+        print(f"best_mean_test_em={float(best_candidate['mean_test_em']):.6f}")
+    else:
+        print("best_params=None")
     print(f"output={output_path}")
 
 

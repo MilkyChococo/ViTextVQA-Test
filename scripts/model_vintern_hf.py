@@ -10,7 +10,7 @@ import math
 import sys
 from pathlib import Path
 
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 
 from model import (
     build_cse_payload,
@@ -55,6 +55,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--repetition-penalty", type=float, default=2.5, help="Repetition penalty.")
     parser.add_argument("--input-size", type=int, default=448, help="Tile size used by Vintern preprocessing.")
     parser.add_argument("--max-num", type=int, default=12, help="Maximum dynamic image tiles.")
+    parser.add_argument("--only-composite", action="store_true", help="Only build composite image then exit.")
     parser.add_argument("--output", default=None, help="Optional output JSON path.")
     return parser.parse_args()
 
@@ -240,18 +241,121 @@ def fit_image(img: Image.Image, max_width: int, max_height: int) -> Image.Image:
     return copy
 
 
-def build_composite_image(image_path: Path, crop_paths: list[tuple[str, Path]], output_path: Path) -> Path:
+def load_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    font_candidates = [
+        "C:/Windows/Fonts/arial.ttf",
+        "C:/Windows/Fonts/tahoma.ttf",
+        "arial.ttf",
+        "tahoma.ttf",
+        "DejaVuSans.ttf",
+    ]
+    for font_path in font_candidates:
+        try:
+            return ImageFont.truetype(font_path, size=size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
+
+
+def measure_text_width(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont | ImageFont.FreeTypeFont) -> int:
+    left, _, right, _ = draw.textbbox((0, 0), text, font=font)
+    return int(right - left)
+
+
+def ellipsize_to_width(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    max_width: int,
+    font: ImageFont.ImageFont | ImageFont.FreeTypeFont,
+) -> str:
+    value = text.strip()
+    if not value:
+        return ""
+    if measure_text_width(draw, value, font) <= max_width:
+        return value
+    while value and measure_text_width(draw, f"{value}...", font) > max_width:
+        value = value[:-1].rstrip()
+    return f"{value}..." if value else "..."
+
+
+def wrap_text_lines(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    max_width: int,
+    font: ImageFont.ImageFont | ImageFont.FreeTypeFont,
+    max_lines: int,
+) -> list[str]:
+    normalized = " ".join(str(text or "").split())
+    if not normalized:
+        return ["(no ocr text)"]
+
+    words = normalized.split(" ")
+    lines: list[str] = []
+    current = ""
+    consumed = 0
+    for word in words:
+        candidate = word if not current else f"{current} {word}"
+        if measure_text_width(draw, candidate, font) <= max_width:
+            current = candidate
+            consumed += 1
+            continue
+
+        if current:
+            lines.append(current)
+            current = word
+            if len(lines) >= max_lines:
+                break
+        else:
+            lines.append(ellipsize_to_width(draw, word, max_width, font))
+            consumed += 1
+            current = ""
+            if len(lines) >= max_lines:
+                break
+
+    if len(lines) < max_lines and current:
+        lines.append(current)
+
+    remaining_words = len(words) - consumed
+    if remaining_words > 0 and lines:
+        lines[-1] = ellipsize_to_width(draw, lines[-1], max_width, font)
+    return lines[:max_lines]
+
+
+def build_composite_image(
+    image_path: Path,
+    crop_paths: list[tuple[str, Path]],
+    node_ocr_texts: dict[str, str],
+    output_path: Path,
+) -> Path:
     base_image = Image.open(image_path).convert("RGB")
     base_panel = fit_image(base_image, max_width=1200, max_height=900)
     margin = 16
     label_h = 24
+    inner_pad = 8
+    ocr_max_lines = 3
     crop_box_w = 260
-    crop_box_h = 220
+    crop_box_h = 280
+    label_font = load_font(14)
+    ocr_font = load_font(16)
+    measure_draw = ImageDraw.Draw(Image.new("RGB", (32, 32), color=(255, 255, 255)))
+    line_top, line_bottom = ocr_font.getbbox("Ag")[1], ocr_font.getbbox("Ag")[3]
+    ocr_line_h = max(16, int(line_bottom - line_top) + 2)
+    ocr_area_h = ocr_line_h * ocr_max_lines + 6
+    image_slot_h = crop_box_h - label_h - ocr_area_h - inner_pad * 3
+    image_slot_w = crop_box_w - inner_pad * 2
 
-    crop_panels: list[tuple[str, Image.Image]] = []
+    crop_panels: list[tuple[str, Image.Image, list[str]]] = []
     for index, (node_id, crop_path) in enumerate(crop_paths, start=1):
         crop_image = Image.open(crop_path).convert("RGB")
-        crop_panels.append((f"crop_ref={index} | {node_id}", fit_image(crop_image, crop_box_w - 12, crop_box_h - label_h - 12)))
+        ocr_text = str(node_ocr_texts.get(node_id, "") or "").strip()
+        ocr_lines = wrap_text_lines(
+            measure_draw,
+            text=ocr_text,
+            max_width=image_slot_w,
+            font=ocr_font,
+            max_lines=ocr_max_lines,
+        )
+        crop_panels.append((f"crop_ref={index} | {node_id}", fit_image(crop_image, image_slot_w, image_slot_h), ocr_lines))
 
     cols = 3
     crop_rows = math.ceil(len(crop_panels) / cols) if crop_panels else 0
@@ -267,16 +371,21 @@ def build_composite_image(image_path: Path, crop_paths: list[tuple[str, Path]], 
     draw.text((base_x, margin + base_panel.height + 4), "image_ref=0 | original_image", fill=(0, 0, 0))
 
     crop_start_y = margin * 2 + base_panel.height + label_h
-    for idx, (label, crop_img) in enumerate(crop_panels):
+    for idx, (label, crop_img, ocr_lines) in enumerate(crop_panels):
         row = idx // cols
         col = idx % cols
         x = margin + col * (crop_box_w + margin)
         y = crop_start_y + row * (crop_box_h + margin)
         draw.rectangle((x, y, x + crop_box_w, y + crop_box_h), outline=(180, 180, 180), width=1)
-        draw.text((x + 4, y + 4), label, fill=(0, 0, 0))
+        draw.text((x + 4, y + 4), label, fill=(0, 0, 0), font=label_font)
         paste_x = x + (crop_box_w - crop_img.width) // 2
-        paste_y = y + label_h + (crop_box_h - label_h - crop_img.height) // 2
+        image_slot_top = y + label_h + inner_pad
+        paste_y = image_slot_top + (image_slot_h - crop_img.height) // 2
         canvas.paste(crop_img, (paste_x, paste_y))
+        ocr_y = y + crop_box_h - ocr_area_h - inner_pad + 2
+        for line in ocr_lines:
+            draw.text((x + inner_pad, ocr_y), line, fill=(0, 0, 0), font=ocr_font)
+            ocr_y += ocr_line_h
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     canvas.save(output_path)
@@ -348,13 +457,24 @@ def main() -> None:
         runtime_crops_dir=config.output_dir / "vlm_vintern_runtime_crops",
         max_crops=args.max_crops,
     )
+    node_ocr_texts = {str(node.get("node_id", "")).strip(): str(node.get("text", "") or "").strip() for node in context_nodes}
     prompt = build_vlm_prompt(args.query, context_nodes=context_nodes, crop_paths=crop_paths)
 
     composite_path = build_composite_image(
         image_path=config.image_path,
         crop_paths=crop_paths,
+        node_ocr_texts=node_ocr_texts,
         output_path=config.output_dir / "vlm_vintern_runtime_crops" / f"composite_{config.image_id}.png",
     )
+
+    if args.only_composite:
+        print(f"query={args.query}")
+        print(f"image_path={config.image_path}")
+        print(f"composite_image={composite_path}")
+        print(f"cse_json={cse_json_path}")
+        print(f"used_nodes={len(context_nodes)}")
+        print(f"used_crops={len(crop_paths)}")
+        return
 
     model, tokenizer = init_vintern_model(args.model)
     answer = generate_with_vintern(
