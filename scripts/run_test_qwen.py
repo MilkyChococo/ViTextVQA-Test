@@ -26,7 +26,7 @@ from model import (
 from model_qwen import DEFAULT_QWEN_MODEL_NAME, generate_with_qwen, init_qwen_model
 from process.text_preprocess import preprocess_query_text
 from utils.config import GraphConfig
-from utils.prompts import build_vlm_prompt
+from utils.prompts import build_image_only_prompt, build_vlm_prompt
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
@@ -129,6 +129,27 @@ def clear_runtime_memory() -> None:
         pass
 
 
+def generate_image_only_answer(
+    *,
+    qwen_model: object,
+    qwen_processor: object,
+    question: str,
+    image_path: Path,
+    max_new_tokens: int,
+    temperature: float,
+) -> str:
+    prompt = build_image_only_prompt(question)
+    return generate_with_qwen(
+        model=qwen_model,
+        processor=qwen_processor,
+        prompt=prompt,
+        image_path=image_path,
+        crop_paths=[],
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+    )
+
+
 def main() -> None:
     try:
         sys.stdout.reconfigure(encoding="utf-8")
@@ -176,6 +197,7 @@ def main() -> None:
     processed = 0
     skipped = 0
     failed = 0
+    fallback = 0
     progress_bar = tqdm(annotations, desc="RunTestQwen", unit="question")
     for ann in progress_bar:
         ann_id = int(ann["id"])
@@ -184,24 +206,62 @@ def main() -> None:
 
         if args.resume and ann_id in answer_by_ann_id:
             skipped += 1
-            progress_bar.set_postfix(processed=processed, skipped=skipped, failed=failed)
+            progress_bar.set_postfix(processed=processed, fallback=fallback, skipped=skipped, failed=failed)
             continue
 
-        if image_id not in graph_cache:
-            image_filename = image_filename_lookup.get(image_id, f"{image_id}.jpg")
-            config = GraphConfig(
-                repo_root=repo_root,
-                image_id=image_id,
-                image_filename=image_filename,
-                output_root=graph_root,
-            )
-            graph_enriched, text_embeddings, crop_embeddings = load_graph_bundle(config)
-            graph_cache[image_id] = (config, graph_enriched, text_embeddings, crop_embeddings)
-            if args.max_graph_cache_size > 0:
-                while len(graph_cache) > args.max_graph_cache_size:
-                    graph_cache.popitem(last=False)
-        else:
-            graph_cache.move_to_end(image_id)
+        image_filename = image_filename_lookup.get(image_id, f"{image_id}.jpg")
+        config = GraphConfig(
+            repo_root=repo_root,
+            image_id=image_id,
+            image_filename=image_filename,
+            output_root=graph_root,
+        )
+
+        try:
+            if image_id not in graph_cache:
+                graph_enriched, text_embeddings, crop_embeddings = load_graph_bundle(config)
+                graph_cache[image_id] = (config, graph_enriched, text_embeddings, crop_embeddings)
+                if args.max_graph_cache_size > 0:
+                    while len(graph_cache) > args.max_graph_cache_size:
+                        graph_cache.popitem(last=False)
+            else:
+                graph_cache.move_to_end(image_id)
+        except Exception as exc:
+            try:
+                answer = generate_image_only_answer(
+                    qwen_model=qwen_model,
+                    qwen_processor=qwen_processor,
+                    question=question,
+                    image_path=config.image_path,
+                    max_new_tokens=args.max_new_tokens,
+                    temperature=args.temperature,
+                )
+                answer_by_ann_id[ann_id] = answer
+                processed += 1
+                fallback += 1
+                print(
+                    f"[FALLBACK] ann_id={ann_id} image_id={image_id} "
+                    f"reason=graph_load_{type(exc).__name__}: {exc}"
+                )
+            except Exception as fallback_exc:
+                answer_by_ann_id[ann_id] = ""
+                failed += 1
+                print(
+                    f"[FAIL] ann_id={ann_id} image_id={image_id} "
+                    f"graph_error={type(exc).__name__}: {exc} "
+                    f"fallback_error={type(fallback_exc).__name__}: {fallback_exc}"
+                )
+            finally:
+                save_prediction_payload(output_path, payload, answer_by_ann_id)
+                clear_runtime_memory()
+                progress_bar.set_postfix(
+                    processed=processed,
+                    fallback=fallback,
+                    skipped=skipped,
+                    failed=failed,
+                    cache=len(graph_cache),
+                )
+            continue
 
         config, graph_enriched, text_embeddings, crop_embeddings = graph_cache[image_id]
         runtime_crops_dir = config.output_dir / "vlm_qwen_runtime_crops"
@@ -262,9 +322,30 @@ def main() -> None:
             answer_by_ann_id[ann_id] = answer
             processed += 1
         except Exception as exc:
-            answer_by_ann_id[ann_id] = ""
-            failed += 1
-            print(f"[FAIL] ann_id={ann_id} image_id={image_id} error={type(exc).__name__}: {exc}")
+            try:
+                answer = generate_image_only_answer(
+                    qwen_model=qwen_model,
+                    qwen_processor=qwen_processor,
+                    question=question,
+                    image_path=config.image_path,
+                    max_new_tokens=args.max_new_tokens,
+                    temperature=args.temperature,
+                )
+                answer_by_ann_id[ann_id] = answer
+                processed += 1
+                fallback += 1
+                print(
+                    f"[FALLBACK] ann_id={ann_id} image_id={image_id} "
+                    f"reason=cse_pipeline_{type(exc).__name__}: {exc}"
+                )
+            except Exception as fallback_exc:
+                answer_by_ann_id[ann_id] = ""
+                failed += 1
+                print(
+                    f"[FAIL] ann_id={ann_id} image_id={image_id} "
+                    f"pipeline_error={type(exc).__name__}: {exc} "
+                    f"fallback_error={type(fallback_exc).__name__}: {fallback_exc}"
+                )
         finally:
             cleanup_runtime_crops(crop_paths, runtime_crops_dir)
             crop_paths = []
@@ -276,11 +357,18 @@ def main() -> None:
             clear_runtime_memory()
 
         save_prediction_payload(output_path, payload, answer_by_ann_id)
-        progress_bar.set_postfix(processed=processed, skipped=skipped, failed=failed, cache=len(graph_cache))
+        progress_bar.set_postfix(
+            processed=processed,
+            fallback=fallback,
+            skipped=skipped,
+            failed=failed,
+            cache=len(graph_cache),
+        )
 
     save_prediction_payload(output_path, payload, answer_by_ann_id)
 
     print(f"processed={processed}")
+    print(f"fallback={fallback}")
     print(f"skipped={skipped}")
     print(f"failed={failed}")
     print(f"output={output_path}")
