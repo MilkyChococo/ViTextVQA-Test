@@ -88,9 +88,32 @@ def build_vlm_prompt(query: str, context_nodes: list[dict[str, Any]], crop_paths
 
 def build_image_only_prompt(query: str) -> str:
     lines: list[str] = []
-    lines.append("Ban la tro ly Visual Question Answering cho tieng Viet.")
-    lines.append("Hay tra loi ngan gon, dung trong tam, chi dua tren anh duoc cung cap.")
-    lines.append("Chi tra loi dap an cuoi cung bang tieng Viet, khong giai thich.")
+    lines.append("You are a Visual Question Answering assistant for Vietnamese questions.")
+    lines.append("Answer briefly and directly, using only the provided image.")
+    lines.append("Return only the final answer in Vietnamese. Do not explain.")
     lines.append("")
-    lines.append(f"Cau hoi: {fix_mojibake(query)}")
+    lines.append(f"Question: {fix_mojibake(query)}")
+    return "\n".join(lines)
+
+
+def build_ocr_prompt(query: str, ocr_rows: list[dict[str, Any]], max_ocr_lines: int = 80) -> str:
+    lines: list[str] = []
+    lines.append("You are a Visual Question Answering assistant for Vietnamese questions.")
+    lines.append("Answer briefly and directly, using only the provided image and OCR text.")
+    lines.append("Return only the final answer in Vietnamese. Do not explain.")
+    lines.append("")
+    lines.append(f"Question: {fix_mojibake(query)}")
+    lines.append("")
+    lines.append("OCR TEXT:")
+    if not ocr_rows:
+        lines.append("- No OCR text available.")
+    else:
+        for index, row in enumerate(ocr_rows[:max_ocr_lines], start=1):
+            text = fix_mojibake(" ".join(str(row.get("text", "")).split()))
+            if len(text) > 160:
+                text = text[:157] + "..."
+            if text:
+                lines.append(f"{index}. {text}")
+    lines.append("")
+    lines.append("FINAL ANSWER:")
     return "\n".join(lines)
