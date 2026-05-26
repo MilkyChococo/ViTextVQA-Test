@@ -189,6 +189,8 @@ def build_graph_conf_context_nodes(
     text_device: str,
     image_device: str,
 ) -> list[dict[str, Any]]:
+    del query
+
     rel_scores = build_query_relevance_scores(
         query_for_embedding=query_for_embedding,
         text_embeddings=text_embeddings,
@@ -211,45 +213,16 @@ def build_graph_conf_context_nodes(
         allowed_node_types=("text",),
     )
     node_index = {str(node.get("node_id", "")): node for node in graph_enriched.get("nodes", [])}
-    outgoing_edges: dict[str, list[dict[str, Any]]] = {}
-    for edge in graph_enriched.get("edges", []):
-        source_id = str(edge.get("source", ""))
-        outgoing_edges.setdefault(source_id, []).append(edge)
 
     selected: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for seed_rank, seed in enumerate(seeds[: args.max_subgraphs], start=1):
+    for seed_rank, seed in enumerate(seeds, start=1):
         seed_node = dict(node_index.get(seed.node_id, {}))
-        if seed_node and seed.node_id not in seen:
-            seed_node["rel"] = seed.rel
-            selected.append(graph_node_to_context(seed_node, seed_rank, seed.rel))
-            seen.add(seed.node_id)
-
-        edges = sorted(
-            outgoing_edges.get(seed.node_id, []),
-            key=lambda item: (
-                args.alpha * float(item.get("conf_off", 0.0) or 0.0)
-                + float(rel_scores.get(str(item.get("target", "")), 0.0))
-            ),
-            reverse=True,
-        )
-        kept_neighbors = 0
-        for edge in edges:
-            if kept_neighbors >= args.max_nodes_per_subgraph - 1:
-                break
-            target_id = str(edge.get("target", ""))
-            neighbor_id = target_id
-            if not neighbor_id or neighbor_id in seen:
-                continue
-            neighbor = dict(node_index.get(neighbor_id, {}))
-            if not neighbor:
-                continue
-            conf = float(edge.get("conf_off", 0.0) or 0.0)
-            rel = float(rel_scores.get(neighbor_id, 0.0))
-            neighbor["rel"] = rel
-            selected.append(graph_node_to_context(neighbor, seed_rank, args.alpha * conf + rel))
-            seen.add(neighbor_id)
-            kept_neighbors += 1
+        if not seed_node or seed.node_id in seen:
+            continue
+        seed_node["rel"] = seed.rel
+        selected.append(graph_node_to_context(seed_node, seed_rank, seed.rel))
+        seen.add(seed.node_id)
     return selected
 
 
